@@ -38,34 +38,49 @@ export function run(input) {
   // Reads an unquoted field starting at pos, onto `prefix` ('' normally; the quoted value
   // when reading the junk after a closing quote). Returns [value, ended, added] where added
   // counts the characters kept after the prefix (a stray CR is dropped, never kept).
+  // The common case is one slice: the field ends at the nearest ',' or LF, and a CR only
+  // matters when one sits before that end, so the CR check runs on the bounded segment
+  // instead of scanning the rest of the text for one.
   function readUnquoted(prefix) {
     let parts = null;
     let start = pos;
     for (;;) {
       const ci = text.indexOf(',', pos);
       const ni = text.indexOf('\n', pos);
-      const ri = text.indexOf('\r', pos);
       let m = -1;
       let kind = 0;
       if (ci !== -1) { m = ci; kind = COMMA; }
       if (ni !== -1 && (m === -1 || ni < m)) { m = ni; kind = LINE_BREAK; }
-      if (ri !== -1 && (m === -1 || ri < m)) { m = ri; kind = 2; }
+      let seg;
       if (m === -1) {
-        // End of the text: the rest of it is the field.
-        const tail = text.slice(start, len);
-        pos = len;
-        if (parts === null) return [prefix === '' ? tail : prefix + tail, END, tail.length];
-        if (tail !== '') parts.push(tail);
-        return [parts.join(''), END, parts.join('').length - prefix.length];
+        // End of the text: the rest of it is the field, unless it holds a stray CR.
+        seg = text.slice(start, len);
+        const ri = seg.indexOf('\r');
+        if (ri === -1) {
+          pos = len;
+          if (parts === null) return [prefix === '' ? seg : prefix + seg, END, seg.length];
+          if (seg !== '') parts.push(seg);
+          const v = parts.join('');
+          return [v, END, v.length - prefix.length];
+        }
+        m = start + ri;
+        kind = 2;
+      } else {
+        seg = text.slice(start, m);
+        const ri = seg.indexOf('\r');
+        if (ri !== -1) {
+          m = start + ri;
+          kind = 2;
+        }
       }
       if (kind === 2) {
         // CR: a line break when followed by LF, else a dropped stray CR (error stray_cr).
         if (m + 1 < len && text.charCodeAt(m + 1) === 10) {
-          const seg = text.slice(start, m);
+          const s2 = text.slice(start, m);
           pos = m + 2;
           line += 1;
-          if (parts === null) return [prefix === '' ? seg : prefix + seg, LINE_BREAK, seg.length];
-          if (seg !== '') parts.push(seg);
+          if (parts === null) return [prefix === '' ? s2 : prefix + s2, LINE_BREAK, s2.length];
+          if (s2 !== '') parts.push(s2);
           const v = parts.join('');
           return [v, LINE_BREAK, v.length - prefix.length];
         }
@@ -79,7 +94,6 @@ export function run(input) {
         start = m + 1;
         continue;
       }
-      const seg = text.slice(start, m);
       pos = m + 1;
       if (kind === LINE_BREAK) line += 1;
       if (parts === null) return [prefix === '' ? seg : prefix + seg, kind, seg.length];
@@ -90,48 +104,48 @@ export function run(input) {
   }
 
   // Reads a quoted field whose opening quote is at pos. Returns [value, ended, added].
+  // The common case is one slice: the next quote closes the field, with no line break
+  // before it, so the CR/LF check runs on the bounded segment up to that quote instead
+  // of scanning the rest of the text for one. A line break inside the quotes is consumed
+  // one at a time, each becoming one LF in the value, and the search for the closing
+  // quote then starts again from just past it.
   function readQuoted() {
     const open = pos;
     const openLine = line;
     let parts = null;
-    let start = pos + 1;
     let p = pos + 1;
     let closed = -1;
     for (;;) {
       const qi = text.indexOf('"', p);
-      const ri = text.indexOf('\r', p);
-      const ni = text.indexOf('\n', p);
-      let m = -1;
-      let kind = 0;
-      if (qi !== -1) { m = qi; kind = 0; }
-      if (ri !== -1 && (m === -1 || ri < m)) { m = ri; kind = 1; }
-      if (ni !== -1 && (m === -1 || ni < m)) { m = ni; kind = 2; }
-      if (m === -1) break; // no closing quote before the end of the text
-      if (kind === 0) {
-        if (m + 1 < len && text.charCodeAt(m + 1) === 34) {
+      if (qi === -1) break; // no closing quote before the end of the text
+      const seg = text.slice(p, qi);
+      const ri = seg.indexOf('\r');
+      const ni = seg.indexOf('\n');
+      if (ri === -1 && ni === -1) {
+        // No line break before this quote.
+        if (qi + 1 < len && text.charCodeAt(qi + 1) === 34) {
           // Doubled quote: one literal quote in the value.
           if (parts === null) parts = [];
-          if (m > start) parts.push(text.slice(start, m));
+          if (seg !== '') parts.push(seg);
           parts.push('"');
-          p = m + 2;
-          start = m + 2;
+          p = qi + 2;
           continue;
         }
-        closed = m;
+        closed = qi;
         break;
       }
-      // CR or LF inside quotes: each is one LF in the value, and one more line.
+      // A CR or LF sits before this quote: consume the nearest one (one LF in the value,
+      // one more line), then look for the closing quote again.
+      let m;
+      let isCR;
+      if (ri !== -1 && (ni === -1 || ri < ni)) { m = p + ri; isCR = true; }
+      else { m = p + ni; isCR = false; }
       if (parts === null) parts = [];
-      if (m > start) parts.push(text.slice(start, m));
+      if (m > p) parts.push(text.slice(p, m));
       parts.push('\n');
       line += 1;
-      if (kind === 1 && m + 1 < len && text.charCodeAt(m + 1) === 10) {
-        p = m + 2;
-        start = m + 2;
-      } else {
-        p = m + 1;
-        start = m + 1;
-      }
+      if (isCR && m + 1 < len && text.charCodeAt(m + 1) === 10) p = m + 2;
+      else p = m + 1;
     }
     if (closed === -1) {
       // The quote never closes: it is a literal character, and the text after it is read
@@ -143,9 +157,9 @@ export function run(input) {
     }
     let value;
     if (parts === null) {
-      value = text.slice(start, closed);
+      value = text.slice(open + 1, closed);
     } else {
-      if (closed > start) parts.push(text.slice(start, closed));
+      if (closed > p) parts.push(text.slice(p, closed));
       value = parts.join('');
     }
     pos = closed + 1;
